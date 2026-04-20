@@ -10,8 +10,10 @@ import datetime
 import subprocess
 import os
 import json
+import sqlite3
 
 OUTPUT_PATH = os.path.expanduser("~/Scripts/market_forecast.html")
+DB_PATH = os.path.expanduser("~/Scripts/market_forecast.db")
 
 # ── Data Fetching ──────────────────────────────────────────────────────────
 
@@ -165,9 +167,157 @@ def combine_signals(signals):
     return combined
 
 
+# ── Database ───────────────────────────────────────────────────────────────
+
+def init_db():
+    """Create the predictions table if it doesn't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prediction_date TEXT UNIQUE,
+            target_date TEXT,
+            up_prob REAL,
+            verdict TEXT,
+            sp_close REAL,
+            vix_close REAL,
+            rsi REAL,
+            signals_json TEXT,
+            actual_return REAL,
+            actual_direction TEXT,
+            correct INTEGER
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def save_prediction(conn, prediction_date, target_date, up_prob, verdict,
+                    sp_close, vix_val, rsi_val, signals):
+    """Insert today's prediction (skip if already exists for this date)."""
+    signals_compact = {k: round(v["prob"], 4) for k, v in signals.items()}
+    conn.execute("""
+        INSERT OR IGNORE INTO predictions
+            (prediction_date, target_date, up_prob, verdict, sp_close, vix_close, rsi, signals_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        prediction_date,
+        target_date,
+        round(up_prob, 4),
+        verdict,
+        round(sp_close, 2),
+        round(vix_val, 2),
+        round(rsi_val, 1),
+        json.dumps(signals_compact),
+    ))
+    conn.commit()
+
+
+def backfill_actuals(conn, sp):
+    """Fill in actual results for past predictions where we now have data."""
+    close = sp["Close"].squeeze()
+    returns = close.pct_change()
+
+    rows = conn.execute(
+        "SELECT id, target_date, up_prob FROM predictions WHERE actual_return IS NULL"
+    ).fetchall()
+
+    for row_id, target_date, up_prob in rows:
+        # Check if we have market data for this target date
+        target_dt = datetime.datetime.strptime(target_date, "%Y-%m-%d")
+        # Find the actual return on the target date
+        matching = returns.loc[returns.index.normalize() == target_dt]
+        if len(matching) == 0:
+            continue
+        actual_ret = float(matching.iloc[0])
+        actual_dir = "UP" if actual_ret > 0 else "DOWN"
+        predicted_up = up_prob >= 0.50
+        actual_up = actual_ret > 0
+        correct = 1 if predicted_up == actual_up else 0
+
+        conn.execute("""
+            UPDATE predictions
+            SET actual_return = ?, actual_direction = ?, correct = ?
+            WHERE id = ?
+        """, (round(actual_ret, 6), actual_dir, correct, row_id))
+
+    conn.commit()
+
+
+def get_history(conn, limit=30):
+    """Fetch recent prediction history for display."""
+    rows = conn.execute("""
+        SELECT prediction_date, target_date, up_prob, verdict,
+               sp_close, actual_return, actual_direction, correct
+        FROM predictions
+        ORDER BY prediction_date DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return rows
+
+
+def get_accuracy_stats(conn):
+    """Compute overall accuracy stats."""
+    total = conn.execute(
+        "SELECT COUNT(*) FROM predictions WHERE correct IS NOT NULL"
+    ).fetchone()[0]
+    if total == 0:
+        return {"total": 0, "correct": 0, "accuracy": None}
+    correct = conn.execute(
+        "SELECT COUNT(*) FROM predictions WHERE correct = 1"
+    ).fetchone()[0]
+    return {"total": total, "correct": correct, "accuracy": correct / total}
+
+
 # ── HTML Generation ────────────────────────────────────────────────────────
 
-def generate_html(signals, combined_prob, close, returns, rsi, vix_close):
+def _build_history_html(history, accuracy):
+    """Build the prediction history table HTML."""
+    if not history:
+        return '<p style="color:#475569;font-size:13px;">No history yet. Predictions will appear here after the first full day.</p>'
+
+    acc_line = ""
+    if accuracy and accuracy["total"] > 0:
+        pct = accuracy["accuracy"] * 100
+        color = "#22c55e" if pct >= 55 else "#fbbf24" if pct >= 50 else "#ef4444"
+        acc_line = f'<div class="accuracy-banner">Accuracy: <strong style="color:{color}">{pct:.0f}%</strong> ({accuracy["correct"]}/{accuracy["total"]} correct predictions)</div>'
+    else:
+        acc_line = '<div class="accuracy-banner">Accuracy tracking will begin once results come in.</div>'
+
+    rows_html = ""
+    for pred_date, target_date, up_prob, verdict, sp_close, actual_ret, actual_dir, correct in history:
+        predicted_dir = "UP" if up_prob >= 0.50 else "DOWN"
+        pred_color = "#22c55e" if predicted_dir == "UP" else "#ef4444"
+
+        if correct is None:
+            result_badge = '<span class="badge badge-pending">Pending</span>'
+            actual_cell = "—"
+        elif correct == 1:
+            result_badge = '<span class="badge badge-correct">Correct</span>'
+            actual_cell = f'<span style="color:{"#22c55e" if actual_ret > 0 else "#ef4444"}">{actual_ret:+.2%}</span>'
+        else:
+            result_badge = '<span class="badge badge-wrong">Wrong</span>'
+            actual_cell = f'<span style="color:{"#22c55e" if actual_ret > 0 else "#ef4444"}">{actual_ret:+.2%}</span>'
+
+        rows_html += f"""<tr>
+          <td>{pred_date}</td>
+          <td>{target_date}</td>
+          <td style="color:{pred_color}">{predicted_dir} ({up_prob:.0%})</td>
+          <td>{actual_cell}</td>
+          <td>{result_badge}</td>
+        </tr>"""
+
+    return f"""{acc_line}
+    <table class="history-table">
+      <thead><tr>
+        <th>Run Date</th><th>Target Date</th><th>Prediction</th><th>Actual</th><th>Result</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>"""
+
+
+def generate_html(signals, combined_prob, close, returns, rsi, vix_close,
+                   history=None, accuracy=None):
     today = datetime.date.today()
     dow = today.weekday()
     if dow == 4:
@@ -481,6 +631,63 @@ def generate_html(signals, combined_prob, close, returns, rsi, vix_close):
   }}
   .hist-svg {{ width: 100%; height: 100px; }}
 
+  /* Prediction history */
+  .history-section {{
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 24px;
+  }}
+  .history-section h3 {{
+    font-size: 13px;
+    font-weight: 500;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }}
+  .accuracy-banner {{
+    font-size: 14px;
+    color: #94a3b8;
+    margin-bottom: 16px;
+  }}
+  .accuracy-banner strong {{
+    color: #f1f5f9;
+    font-size: 18px;
+  }}
+  .history-table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }}
+  .history-table th {{
+    text-align: left;
+    color: #475569;
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }}
+  .history-table td {{
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    color: #cbd5e1;
+  }}
+  .history-table tr:hover td {{ background: rgba(255,255,255,0.02); }}
+  .badge {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }}
+  .badge-correct {{ background: rgba(34,197,94,0.15); color: #22c55e; }}
+  .badge-wrong {{ background: rgba(239,68,68,0.15); color: #ef4444; }}
+  .badge-pending {{ background: rgba(251,191,36,0.10); color: #fbbf24; }}
+
   .disclaimer {{
     text-align: center;
     font-size: 11px;
@@ -568,6 +775,12 @@ def generate_html(signals, combined_prob, close, returns, rsi, vix_close):
     </svg>
   </div>
 
+  <!-- Prediction History -->
+  <div class="history-section">
+    <h3>Prediction Track Record</h3>
+    {_build_history_html(history, accuracy)}
+  </div>
+
   <div class="disclaimer">
     This is a statistical model based on historical patterns (momentum, mean reversion, RSI, VIX, seasonality).<br>
     It is NOT financial advice. Past patterns do not guarantee future results. Markets are inherently unpredictable.<br>
@@ -589,8 +802,48 @@ def main():
     signals, close, returns, rsi, vix_close = compute_signals(sp, vix)
     combined = combine_signals(signals)
 
+    # Determine verdict label
+    if combined >= 0.58:
+        verdict = "BULLISH"
+    elif combined >= 0.53:
+        verdict = "LEAN BULLISH"
+    elif combined <= 0.42:
+        verdict = "BEARISH"
+    elif combined <= 0.47:
+        verdict = "LEAN BEARISH"
+    else:
+        verdict = "NEUTRAL"
+
+    # Compute target date (next trading day)
+    today = datetime.date.today()
+    dow = today.weekday()
+    if dow == 4:
+        next_day = today + datetime.timedelta(days=3)
+    elif dow >= 5:
+        next_day = today + datetime.timedelta(days=(7 - dow))
+    else:
+        next_day = today + datetime.timedelta(days=1)
+
+    sp_price = float(close.iloc[-1])
+    rsi_val = float(rsi.iloc[-1])
+    vix_val = float(vix_close.squeeze().iloc[-1])
+
+    # ── Database ──
+    print("Updating prediction database...")
+    conn = init_db()
+    backfill_actuals(conn, sp)
+    save_prediction(conn, today.isoformat(), next_day.isoformat(),
+                    combined, verdict, sp_price, vix_val, rsi_val, signals)
+    history = get_history(conn)
+    accuracy = get_accuracy_stats(conn)
+    conn.close()
+
     print(f"Combined probability of UP day: {combined:.1%}")
-    html = generate_html(signals, combined, close, returns, rsi, vix_close)
+    if accuracy["total"] > 0:
+        print(f"Track record: {accuracy['correct']}/{accuracy['total']} correct ({accuracy['accuracy']:.0%})")
+
+    html = generate_html(signals, combined, close, returns, rsi, vix_close,
+                         history=history, accuracy=accuracy)
 
     with open(OUTPUT_PATH, "w") as f:
         f.write(html)
